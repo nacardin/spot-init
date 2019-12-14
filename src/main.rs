@@ -1,17 +1,17 @@
+mod process;
+
 use clap::{app_from_crate, crate_authors, crate_description, crate_name, crate_version, Arg};
 use crossbeam_channel::bounded;
-use crossbeam_channel::{Select, Sender};
-use libc::kill;
+use crossbeam_channel::Sender;
 use serde_derive::Deserialize;
 use signal_hook::iterator::Signals;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::prelude::*;
-use std::process;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use process::Process;
 
 type Signal = i32;
 
@@ -50,25 +50,23 @@ fn main() {
 
     let processes_thread_safe = Arc::new(processes);
 
-    let is_pid1 = process::id() == 1;
+    let is_pid1 = std::process::id() == 1;
+    if is_pid1 {
+        println!("running as pid1");
+    }
 
     let (signal_tx, signal_rx) = bounded::<Signal>(0);
     let signal_tx_clone = signal_tx.clone();
     register_sig_handler(signal_tx_clone, is_pid1);
 
-    if is_pid1 {
-        println!("running as pid1");
-
-        let processes_thread_safe = processes_thread_safe.clone();
-        thread::spawn(move || {
-            let signal = signal_rx
-                .recv()
-                .expect("failed to receive signal message in main");
-            processes_thread_safe.iter().for_each(|process| {
-                process.send_signal(signal);
-            })
-        });
-    }
+    thread::spawn(move || {
+        let signal = signal_rx
+            .recv()
+            .expect("failed to receive signal message in main");
+        processes_thread_safe.iter().for_each(|process| {
+            process.send_signal(signal);
+        })
+    });
     let signal_tx_clone = signal_tx.clone();
     thread::spawn(move || {
         loop {
@@ -83,7 +81,7 @@ fn main() {
                     .expect("failed to send signal message based on exit message");
             }
         }
-        println!("done");
+        println!("all subprocesses have exited");
     })
     .join()
     .expect("failed to join exit loop thread");
@@ -121,81 +119,4 @@ fn register_sig_handler(signal_tx: Sender<Signal>, is_pid1: bool) {
             }
         });
     });
-}
-
-#[derive(Debug)]
-struct Process {
-    name: String,
-    pid: u32,
-    signal_tx: Sender<Signal>,
-    is_alive: Arc<AtomicBool>,
-}
-
-impl Process {
-    pub fn new(name: String, command: String, exit_tx: Sender<()>) -> Self {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .spawn()
-            .expect(&format!("failed to execute {}: `{}`", name, command));
-
-        let pid = child.id();
-        let is_alive = Arc::new(AtomicBool::new(true));
-        let (signal_tx, signal_rx) = bounded::<Signal>(0);
-        let (local_exit_tx, local_exit_rx) = bounded::<()>(0);
-
-        let name_clone = name.clone();
-        thread::spawn(move || loop {
-            let mut select = Select::new();
-            select.recv(&signal_rx);
-            select.recv(&local_exit_rx);
-            select.ready();
-            if let Ok(signal) = signal_rx.try_recv() {
-                let signal_name = match signal {
-                    signal_hook::SIGTERM => "SIGTERM",
-                    signal_hook::SIGINT => "SIGINT",
-                    signal_hook::SIGQUIT => "SIGQUIT",
-                    _ => "SIGUNKNOWN",
-                };
-                println!("sending {} to {}", signal_name, name_clone);
-                unsafe {
-                    kill(pid as i32, signal);
-                }
-            }
-            if let Ok(()) = local_exit_rx.try_recv() {
-                break;
-            }
-        });
-
-        let is_alive_clone = is_alive.clone();
-        let name_clone = name.clone();
-        thread::spawn(move || {
-            let exit_status = child
-                .wait()
-                .expect(&format!("failed to wait on {}", name_clone));
-            is_alive_clone.store(false, Ordering::Relaxed);
-            println!("{} exited with: {}", name_clone, exit_status);
-            exit_tx
-                .send(())
-                .expect("failed to send exit message in Process::new");
-            local_exit_tx
-                .send(())
-                .expect("failed to send local exit message in Process::new");
-        });
-
-        Self {
-            name,
-            pid,
-            signal_tx,
-            is_alive,
-        }
-    }
-
-    pub fn send_signal(&self, signal: Signal) {
-        if self.is_alive.load(Ordering::Relaxed) {
-            self.signal_tx
-                .send(signal)
-                .expect("failed to send signal message in Process::send_signal");
-        }
-    }
 }
