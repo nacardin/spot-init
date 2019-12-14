@@ -1,0 +1,3 @@
+[processes]
+ping = "ping localhost"
+sleep = "sleep 5"
