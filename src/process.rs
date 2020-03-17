@@ -18,6 +18,7 @@ pub struct Process {
 
 impl Process {
     pub fn new(name: String, command: String, exit_tx: Sender<()>) -> Self {
+        // TODO: use shlex and execve, and setuid/setgid
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(&command)
